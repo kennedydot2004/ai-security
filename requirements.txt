@@ -1,4 +1,6 @@
+altair
 matplotlib
+pandas
 requests
 streamlit
 wordcloud
