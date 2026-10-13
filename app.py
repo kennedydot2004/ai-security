@@ -2,6 +2,20 @@ import streamlit as st
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
 import io
+import requests
+
+CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_cisa_kev():
+    response = requests.get(CISA_KEV_URL, timeout=15)
+    response.raise_for_status()
+    catalog = response.json()
+    vulnerabilities = catalog.get("vulnerabilities") if isinstance(catalog, dict) else None
+    if not isinstance(vulnerabilities, list):
+        raise ValueError("CISA returned an unexpected catalog format.")
+    return catalog.get("catalogVersion", "unknown"), vulnerabilities
 
 # 1. Page Configuration & Title
 st.set_page_config(
@@ -73,26 +87,70 @@ with col1:
     # Preset selection helpers
     preset_choice = st.radio(
         "Load an AI Engineering Vocabulary Preset:",
-        options=["Strict AI Security & Guardrails", "Telemetry & Observability", "Combined Full LLMOps Stack", "Clear Canvas (Empty)"]
+        options=[
+            "Strict AI Security & Guardrails",
+            "Telemetry & Observability",
+            "Combined Full LLMOps Stack",
+            "Clear Canvas (Empty)",
+            "Live CISA KEV Catalog",
+        ]
     )
     
     # Initialize session text depending on preset selection
     default_text = ""
+    input_key = f"wordcloud_input_{preset_choice}"
     if preset_choice == "Strict AI Security & Guardrails":
         default_text = preset_security.strip()
     elif preset_choice == "Telemetry & Observability":
         default_text = preset_telemetry.strip()
     elif preset_choice == "Combined Full LLMOps Stack":
         default_text = preset_security.strip() + " " + preset_telemetry.strip() + " " + preset_full_llm_ops.strip()
+    elif preset_choice == "Live CISA KEV Catalog":
+        record_limit = st.sidebar.select_slider(
+            "Recent CISA vulnerabilities",
+            options=[25, 50, 100, 250],
+            value=100,
+        )
+        if st.sidebar.button("Refresh CISA data", use_container_width=True):
+            fetch_cisa_kev.clear()
+
+        try:
+            with st.spinner("Loading the CISA KEV catalog..."):
+                catalog_version, vulnerabilities = fetch_cisa_kev()
+            recent_vulnerabilities = sorted(
+                vulnerabilities,
+                key=lambda item: item.get("dateAdded", ""),
+                reverse=True,
+            )[:record_limit]
+            text_fields = (
+                "vulnerabilityName",
+                "shortDescription",
+                "vendorProject",
+                "product",
+                "requiredAction",
+            )
+            default_text = "\n".join(
+                " ".join(str(item[field]) for field in text_fields if item.get(field))
+                for item in recent_vulnerabilities
+            )
+            input_key = f"wordcloud_input_cisa_{record_limit}_{catalog_version}"
+            st.caption(
+                f"Source: [CISA KEV catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) "
+                f"· Version {catalog_version} · {len(recent_vulnerabilities)} recent records · Cached for up to 1 hour."
+            )
+        except (requests.RequestException, ValueError, AttributeError) as exc:
+            st.error(f"Could not load CISA KEV data: {exc}")
+            input_key = "wordcloud_input_cisa_unavailable"
         
     user_input = st.text_area(
         "Edit words or paste custom entries here (separate words with spaces or newlines):",
         value=default_text,
-        height=320
+        height=320,
+        key=input_key,
     )
 
 with col2:
-    st.subheader("🖼️ Real-Time Preview Layout")
+    st.subheader("Real-Time Preview Layout")
     
     if not user_input.strip():
         st.warning("Please type or select a preset on the left panel to populate the layout graphic.")
