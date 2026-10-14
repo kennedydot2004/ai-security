@@ -2,12 +2,15 @@ import streamlit as st
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
 import io
+import os
 import requests
 import altair as alt
 import pandas as pd
 
 CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 HF_MODELS_API_URL = "https://huggingface.co/api/models"
+OPENML_FLOWS_API_URL = "https://www.openml.org/api/v1/json/flow/list"
+OPENML_FLOW_PAGE_URL = "https://www.openml.org/f/"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -30,6 +33,44 @@ def fetch_hf_models(limit=2000):
     if not isinstance(data, list):
         raise ValueError("Hugging Face returned an unexpected model catalog format.")
     return data
+
+
+def get_openml_api_key():
+    """Read the OpenML key from st.secrets, falling back to the environment."""
+    try:
+        key = st.secrets.get("OPENML_API_KEY")
+    except Exception:  # no secrets file configured
+        key = None
+    key = key or os.getenv("OPENML_API_KEY")
+    return str(key).strip() if key else None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_openml_models(limit=2000):
+    api_key = get_openml_api_key()
+    if not api_key:
+        raise ValueError(
+            "OpenML API key is not configured. Set OPENML_API_KEY in Streamlit secrets "
+            "or as an environment variable."
+        )
+    url = f"{OPENML_FLOWS_API_URL}/limit/{int(limit)}"
+    try:
+        response = requests.get(url, params={"api_key": api_key}, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as exc:
+        # Do not chain/echo the exception: its text can contain the request URL and key.
+        status = getattr(exc.response, "status_code", None)
+        detail = f"HTTP {status}" if status else type(exc).__name__
+        raise ValueError(f"OpenML request failed ({detail}).") from None
+    except ValueError:
+        raise ValueError("OpenML returned a response that is not valid JSON.") from None
+    flows = data.get("flows", {}).get("flow") if isinstance(data, dict) else None
+    if isinstance(flows, dict):
+        flows = [flows]
+    if not isinstance(flows, list):
+        raise ValueError("OpenML returned an unexpected model catalog format.")
+    return flows
 
 
 def selected_chart_values(widget_key, selection_name, field_name):
@@ -355,13 +396,49 @@ def _safe_count(value):
     return int(number) if pd.notna(number) and number >= 0 else 0
 
 
-def normalize_hf_models(raw_models):
-    columns = [
+def hf_model_url(row):
+    return f"https://huggingface.co/{row['model_id']}" if row["model_id"] else ""
+
+
+def openml_model_url(row):
+    return f"{OPENML_FLOW_PAGE_URL}{row['openml_id']}" if row.get("openml_id") else ""
+
+
+def _finalize_model_frame(rows, columns, url_builder):
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    df["createdAt"] = pd.to_datetime(df["createdAt"], errors="coerce", utc=True)
+    df["lastModified"] = pd.to_datetime(df["lastModified"], errors="coerce", utc=True)
+    df["days_since_update"] = (
+        (pd.Timestamp.now(tz="UTC") - df["lastModified"]).dt.days.fillna(99999).clip(lower=0)
+    ).astype(int)
+
+    # Baseline feature engineering only; scoring is applied by apply_risk_scores().
+    df["is_unknown_license"] = df["license"].str.casefold().isin(UNKNOWN_LICENSES)
+    df["is_missing_card"] = ~df["has_model_card_like"]
+    df["is_stale"] = df["days_since_update"] > 365
+    df["is_gated"] = df["gated"]
+    df["is_disabled"] = df["disabled"]
+    df["is_high_adoption_low_transparency"] = (
+        df["downloads"] >= df["downloads"].quantile(0.90)
+    ) & (df["is_unknown_license"] | df["is_missing_card"])
+    df["model_url"] = [url_builder(row) for row in df.to_dict("records")]
+    return df[columns]
+
+
+def _model_columns():
+    return [
         "model_id", "author", "pipeline_tag", "library_name", "downloads", "likes",
         "license", "createdAt", "lastModified", "tags", "has_model_card_like",
         "private", "gated", "disabled", "days_since_update", *RISK_FEATURES,
         "model_url",
     ]
+
+
+def normalize_hf_models(raw_models):
+    columns = _model_columns()
     rows = []
     for item in raw_models or []:
         if not isinstance(item, dict):
@@ -395,29 +472,47 @@ def normalize_hf_models(raw_models):
             }
         )
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return pd.DataFrame(columns=columns)
+    return _finalize_model_frame(rows, columns, hf_model_url)
 
-    df["createdAt"] = pd.to_datetime(df["createdAt"], errors="coerce", utc=True)
-    df["lastModified"] = pd.to_datetime(df["lastModified"], errors="coerce", utc=True)
-    df["days_since_update"] = (
-        (pd.Timestamp.now(tz="UTC") - df["lastModified"]).dt.days.fillna(99999).clip(lower=0)
-    ).astype(int)
 
-    # Baseline feature engineering only; scoring is applied by apply_risk_scores().
-    df["is_unknown_license"] = df["license"].str.casefold().isin(UNKNOWN_LICENSES)
-    df["is_missing_card"] = ~df["has_model_card_like"]
-    df["is_stale"] = df["days_since_update"] > 365
-    df["is_gated"] = df["gated"]
-    df["is_disabled"] = df["disabled"]
-    df["is_high_adoption_low_transparency"] = (
-        df["downloads"] >= df["downloads"].quantile(0.90)
-    ) & (df["is_unknown_license"] | df["is_missing_card"])
-    df["model_url"] = df["model_id"].apply(
-        lambda model_id: f"https://huggingface.co/{model_id}" if model_id else ""
-    )
-    return df[columns]
+def normalize_openml_models(raw_models):
+    columns = _model_columns()
+    rows = []
+    for item in raw_models or []:
+        if not isinstance(item, dict):
+            continue
+        flow_id = item.get("id")
+        name = str(item.get("full_name") or item.get("name") or "").strip()
+        if not name and flow_id is None:
+            continue
+        tags = item.get("tag") if "tag" in item else item.get("tags")
+        if isinstance(tags, str):
+            tags = [tags]
+        tags = [str(tag) for tag in tags if tag is not None] if isinstance(tags, list) else []
+        library = str(item.get("library_name") or "").strip()
+        if not library and "." in name:
+            library = name.split(".", 1)[0]
+        license_value = str(item.get("licence") or item.get("license") or "unknown").strip() or "unknown"
+        rows.append(
+            {
+                "model_id": name or str(flow_id),
+                "openml_id": str(flow_id) if flow_id is not None else "",
+                "author": str(item.get("uploader") or "unknown"),
+                "pipeline_tag": str(item.get("task_type") or "unknown"),
+                "library_name": library or "unknown",
+                "downloads": _safe_count(item.get("downloads")),
+                "likes": 0,
+                "license": license_value,
+                "createdAt": item.get("upload_date"),
+                "lastModified": item.get("upload_date"),
+                "tags": tags,
+                "has_model_card_like": bool(item.get("description")),
+                "private": False,
+                "gated": False,
+                "disabled": False,
+            }
+        )
+    return _finalize_model_frame(rows, columns, openml_model_url)
 
 
 def apply_risk_scores(models, weights):
@@ -452,12 +547,22 @@ def load_hf_models():
     return normalize_hf_models(fetch_hf_models())
 
 
+def load_openml_models():
+    return normalize_openml_models(fetch_openml_models())
+
+
 # Provider registry: label -> loader returning a normalized frame (None = coming soon).
 # New providers should supply a fetch + normalize pair producing the same columns.
 MODEL_HUB_PROVIDERS = {
     "Hugging Face": load_hf_models,
-    "OpenML (coming soon)": None,
+    "OpenML": load_openml_models,
     "Kaggle (coming soon)": None,
+}
+
+# Provider label -> (display name, docs URL, cached fetch function to clear on refresh).
+MODEL_HUB_SOURCES = {
+    "Hugging Face": ("Hugging Face", "https://huggingface.co/docs/hub/api", fetch_hf_models),
+    "OpenML": ("OpenML", "https://www.openml.org/apis", fetch_openml_models),
 }
 
 
@@ -472,29 +577,30 @@ def render_model_hub_dashboard():
         )
         return
 
+    source_label, source_url, refresh_fn = MODEL_HUB_SOURCES[provider]
     st.caption(
-        "Explore adoption, transparency, risk, and operational signals from public Hugging Face model metadata."
+        f"Explore adoption, transparency, risk, and operational signals from public {source_label} model metadata."
     )
 
     if st.sidebar.button("Refresh model hub data", width="stretch"):
-        fetch_hf_models.clear()
+        refresh_fn.clear()
     weights = render_risk_weight_controls()
 
     try:
-        with st.spinner("Loading the Hugging Face model catalog..."):
+        with st.spinner(f"Loading the {source_label} model catalog..."):
             models = loader()
     except (requests.RequestException, ValueError) as exc:
-        st.error(f"Could not load Hugging Face model data: {exc}")
+        st.error(f"Could not load {source_label} model data: {exc}")
         return
 
     if models.empty:
-        st.warning("The Hugging Face API returned no model records.")
+        st.warning(f"The {source_label} API returned no model records.")
         return
 
     models = apply_risk_scores(models, weights)
 
     st.caption(
-        f"Source: [Hugging Face Hub API](https://huggingface.co/docs/hub/api) "
+        f"Source: [{source_label} API]({source_url}) "
         f"· {len(models):,} models · Cached for up to 1 hour."
     )
 
@@ -677,7 +783,7 @@ def render_model_hub_dashboard():
         selected = table.iloc[selected_rows[0]]
         st.subheader(selected["model_id"])
         if selected["model_url"]:
-            st.markdown(f"[Open model on Hugging Face]({selected['model_url']})")
+            st.markdown(f"[Open model on {source_label}]({selected['model_url']})")
         detail_columns = st.columns(4)
         detail_columns[0].metric("Downloads", f"{selected['downloads']:,}")
         detail_columns[1].metric("Likes", f"{selected['likes']:,}")
