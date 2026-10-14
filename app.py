@@ -7,6 +7,7 @@ import altair as alt
 import pandas as pd
 
 CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+HF_MODELS_API_URL = "https://huggingface.co/api/models"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -18,6 +19,17 @@ def fetch_cisa_kev():
     if not isinstance(vulnerabilities, list):
         raise ValueError("CISA returned an unexpected catalog format.")
     return catalog.get("catalogVersion", "unknown"), vulnerabilities
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_hf_models(limit=2000):
+    params = {"limit": int(limit), "full": "true", "config": "true"}
+    response = requests.get(HF_MODELS_API_URL, params=params, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, list):
+        raise ValueError("Hugging Face returned an unexpected model catalog format.")
+    return data
 
 
 def selected_chart_values(widget_key, selection_name, field_name):
@@ -319,6 +331,310 @@ def render_cisa_dashboard():
         st.markdown("**CISA required action**")
         st.write(selected["requiredAction"] or "No required action provided.")
 
+UNKNOWN_LICENSES = ["unknown", "other", ""]
+
+
+def _safe_count(value):
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    return int(number) if pd.notna(number) and number >= 0 else 0
+
+
+def normalize_hf_models(raw_models):
+    columns = [
+        "model_id", "author", "pipeline_tag", "library_name", "downloads", "likes",
+        "license", "createdAt", "lastModified", "tags", "has_model_card_like",
+        "private", "gated", "disabled", "days_since_update", "risk_score",
+        "risk_band", "model_url",
+    ]
+    rows = []
+    for item in raw_models or []:
+        if not isinstance(item, dict):
+            continue
+        tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+        tags = [str(tag) for tag in tags if tag is not None]
+        model_id = str(item.get("id") or item.get("modelId") or "")
+        author = item.get("author") or (model_id.split("/", 1)[0] if "/" in model_id else None)
+        license_value = "unknown"
+        for tag in tags:
+            if tag.startswith("license:"):
+                license_value = tag.split("license:", 1)[1].strip() or "unknown"
+                break
+        rows.append(
+            {
+                "model_id": model_id,
+                "author": str(author or "unknown"),
+                "pipeline_tag": str(item.get("pipeline_tag") or "unknown"),
+                "library_name": str(item.get("library_name") or "unknown"),
+                "downloads": _safe_count(item.get("downloads")),
+                "likes": _safe_count(item.get("likes")),
+                "license": license_value,
+                "createdAt": item.get("createdAt"),
+                "lastModified": item.get("lastModified"),
+                "tags": tags,
+                "has_model_card_like": any(tag.startswith("model-index") for tag in tags)
+                or bool(item.get("cardData")),
+                "private": bool(item.get("private", False)),
+                "gated": item.get("gated") not in (False, None, ""),
+                "disabled": bool(item.get("disabled", False)),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+
+    df["createdAt"] = pd.to_datetime(df["createdAt"], errors="coerce", utc=True)
+    df["lastModified"] = pd.to_datetime(df["lastModified"], errors="coerce", utc=True)
+    df["days_since_update"] = (
+        (pd.Timestamp.now(tz="UTC") - df["lastModified"]).dt.days.fillna(99999).clip(lower=0)
+    ).astype(int)
+
+    unknown_license = df["license"].str.casefold().isin(UNKNOWN_LICENSES)
+    low_transparency = unknown_license | ~df["has_model_card_like"]
+    high_adoption = df["downloads"] >= df["downloads"].quantile(0.90)
+    raw_risk = (
+        unknown_license.astype(int) * 25
+        + (~df["has_model_card_like"]).astype(int) * 25
+        + (df["days_since_update"] > 365).astype(int) * 20
+        + df["gated"].astype(int) * 10
+        + df["disabled"].astype(int) * 20
+        + (high_adoption & low_transparency).astype(int) * 20
+    )
+    df["risk_score"] = raw_risk.clip(0, 100)
+    df["risk_band"] = pd.cut(
+        df["risk_score"], bins=[-1, 29, 59, 100], labels=["Low", "Medium", "High"]
+    ).astype(str)
+    df["model_url"] = df["model_id"].apply(
+        lambda model_id: f"https://huggingface.co/{model_id}" if model_id else ""
+    )
+    return df[columns]
+
+
+def render_model_hub_dashboard():
+    st.title("Model Hub Intelligence")
+    st.caption(
+        "Explore adoption, transparency, risk, and operational signals from public Hugging Face model metadata."
+    )
+
+    if st.sidebar.button("Refresh model hub data", width="stretch"):
+        fetch_hf_models.clear()
+
+    try:
+        with st.spinner("Loading the Hugging Face model catalog..."):
+            models = normalize_hf_models(fetch_hf_models())
+    except (requests.RequestException, ValueError) as exc:
+        st.error(f"Could not load Hugging Face model data: {exc}")
+        return
+
+    if models.empty:
+        st.warning("The Hugging Face API returned no model records.")
+        return
+
+    st.caption(
+        f"Source: [Hugging Face Hub API](https://huggingface.co/docs/hub/api) "
+        f"· {len(models):,} models · Cached for up to 1 hour."
+    )
+
+    filter_columns = st.columns([1.3, 1.3, 1.3, 1, 1.2, 2])
+    selected_tasks = filter_columns[0].multiselect(
+        "Task", sorted(models["pipeline_tag"].unique()), placeholder="All tasks"
+    )
+    selected_libraries = filter_columns[1].multiselect(
+        "Library", sorted(models["library_name"].unique()), placeholder="All libraries"
+    )
+    selected_licenses = filter_columns[2].multiselect(
+        "License", sorted(models["license"].unique()), placeholder="All licenses"
+    )
+    risk_filter = filter_columns[3].selectbox("Risk band", ["All", "Low", "Medium", "High"])
+    recency_filter = filter_columns[4].selectbox(
+        "Update recency",
+        ["Any", "≤ 30 days", "≤ 90 days", "≤ 365 days", "> 365 days"],
+    )
+    search_query = filter_columns[5].text_input("Search models")
+
+    filtered = models.copy()
+    if selected_tasks:
+        filtered = filtered[filtered["pipeline_tag"].isin(selected_tasks)]
+    if selected_libraries:
+        filtered = filtered[filtered["library_name"].isin(selected_libraries)]
+    if selected_licenses:
+        filtered = filtered[filtered["license"].isin(selected_licenses)]
+    if risk_filter != "All":
+        filtered = filtered[filtered["risk_band"] == risk_filter]
+    recency_limits = {"≤ 30 days": 30, "≤ 90 days": 90, "≤ 365 days": 365}
+    if recency_filter in recency_limits:
+        filtered = filtered[filtered["days_since_update"] <= recency_limits[recency_filter]]
+    elif recency_filter == "> 365 days":
+        filtered = filtered[filtered["days_since_update"] > 365]
+    if search_query.strip():
+        searchable = filtered[
+            ["model_id", "author", "pipeline_tag", "library_name"]
+        ].fillna("").astype(str).agg(" ".join, axis=1)
+        filtered = filtered[
+            searchable.str.contains(search_query.strip(), case=False, regex=False)
+        ]
+
+    if filtered.empty:
+        transparent_share = 0.0
+    else:
+        transparent_share = (
+            filtered["has_model_card_like"]
+            & ~filtered["license"].str.casefold().isin(UNKNOWN_LICENSES)
+        ).mean() * 100
+    metric_columns = st.columns(5)
+    metric_columns[0].metric("Models loaded", f"{len(models):,}")
+    metric_columns[1].metric("Matching filters", f"{len(filtered):,}")
+    metric_columns[2].metric(
+        "Median downloads", f"{int(filtered['downloads'].median()) if len(filtered) else 0:,}"
+    )
+    metric_columns[3].metric(
+        "Average risk score", f"{filtered['risk_score'].mean():.1f}" if len(filtered) else "0.0"
+    )
+    metric_columns[4].metric("Transparency coverage", f"{transparent_share:.1f}%")
+
+    if filtered.empty:
+        st.info("No models match these filters.")
+        return
+
+    buckets = ["0", "1–99", "100–999", "1K–9.9K", "10K–99K", "100K+"]
+    bucket_series = pd.cut(
+        filtered["downloads"],
+        bins=[-1, 0, 99, 999, 9999, 99999, float("inf")],
+        labels=buckets,
+    )
+    bucket_counts = (
+        bucket_series.value_counts().reindex(buckets, fill_value=0).rename("models").reset_index()
+    )
+    bucket_counts.columns = ["bucket", "models"]
+    adoption_chart = (
+        alt.Chart(bucket_counts)
+        .mark_bar(color="#087f73")
+        .encode(
+            x=alt.X("bucket:N", sort=buckets, title="Downloads"),
+            y=alt.Y("models:Q", title="Models"),
+            tooltip=["bucket:N", "models:Q"],
+        )
+        .properties(height=280)
+    )
+    st.subheader("Adoption distribution")
+    st.altair_chart(adoption_chart, width="stretch")
+
+    def top_counts(column):
+        return (
+            filtered.groupby(column).size().nlargest(10).rename("models").reset_index()
+        )
+
+    task_column, license_column = st.columns(2)
+    for container, title, column, color in (
+        (task_column, "Top tasks", "pipeline_tag", "#087f73"),
+        (license_column, "Top licenses", "license", "#bd5b26"),
+    ):
+        with container:
+            st.subheader(title)
+            chart = (
+                alt.Chart(top_counts(column))
+                .mark_bar(color=color)
+                .encode(
+                    x=alt.X("models:Q", title="Models"),
+                    y=alt.Y(f"{column}:N", sort="-x", title=None),
+                    tooltip=[f"{column}:N", "models:Q"],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(chart, width="stretch")
+
+    trend_data = (
+        filtered.dropna(subset=["lastModified"])
+        .assign(
+            month=lambda frame: frame["lastModified"]
+            .dt.tz_localize(None)
+            .dt.to_period("M")
+            .dt.to_timestamp()
+        )
+        .groupby("month", as_index=False)
+        .size()
+        .rename(columns={"size": "models"})
+    )
+    st.subheader("Model updates over time")
+    if trend_data.empty:
+        st.caption("No valid update dates in these records.")
+    else:
+        trend_chart = (
+            alt.Chart(trend_data)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("month:T", title="Last modified"),
+                y=alt.Y("models:Q", title="Models updated"),
+                tooltip=[alt.Tooltip("month:T", title="Month"), alt.Tooltip("models:Q", title="Models")],
+            )
+            .interactive()
+            .properties(height=250)
+        )
+        st.altair_chart(trend_chart, width="stretch")
+
+    st.subheader("Matching models")
+    table = filtered.sort_values("downloads", ascending=False).reset_index(drop=True)
+    table_view = table[
+        [
+            "model_id", "author", "pipeline_tag", "library_name", "license",
+            "downloads", "likes", "days_since_update", "risk_score", "risk_band",
+        ]
+    ].rename(
+        columns={
+            "model_id": "Model",
+            "author": "Author",
+            "pipeline_tag": "Task",
+            "library_name": "Library",
+            "license": "License",
+            "downloads": "Downloads",
+            "likes": "Likes",
+            "days_since_update": "Days since update",
+            "risk_score": "Risk score",
+            "risk_band": "Risk band",
+        }
+    )
+    table_selection = st.dataframe(
+        table_view,
+        on_select="rerun",
+        selection_mode="single-row",
+        hide_index=True,
+        height=420,
+        width="stretch",
+        key="model_hub_table",
+    )
+    st.download_button(
+        "Download filtered models as CSV",
+        data=table_view.to_csv(index=False),
+        file_name="model_hub_filtered.csv",
+        mime="text/csv",
+    )
+
+    selected_rows = table_selection.selection.rows
+    if selected_rows and selected_rows[0] < len(table):
+        selected = table.iloc[selected_rows[0]]
+        st.subheader(selected["model_id"])
+        if selected["model_url"]:
+            st.markdown(f"[Open model on Hugging Face]({selected['model_url']})")
+        detail_columns = st.columns(4)
+        detail_columns[0].metric("Downloads", f"{selected['downloads']:,}")
+        detail_columns[1].metric("Likes", f"{selected['likes']:,}")
+        detail_columns[2].metric("Risk score", f"{selected['risk_score']}")
+        detail_columns[3].metric("Risk band", selected["risk_band"])
+        st.write(
+            f"**Task:** {selected['pipeline_tag']} · **Library:** {selected['library_name']} "
+            f"· **License:** {selected['license']} · **Days since update:** {selected['days_since_update']}"
+        )
+        st.write(
+            f"**Model card signal:** {'yes' if selected['has_model_card_like'] else 'no'} "
+            f"· **Gated:** {'yes' if selected['gated'] else 'no'} "
+            f"· **Disabled:** {'yes' if selected['disabled'] else 'no'}"
+        )
+
 # 1. Page Configuration & Title
 st.set_page_config(
     page_title="CISA KEV Intelligence",
@@ -347,10 +663,12 @@ Prompt-Engineering Fine-Tuning Inference GPU-Utilization Context-Window Evaluati
 
 # 3. Workspace selection
 st.sidebar.header("Workspace")
-workspace = st.sidebar.radio("Choose a view", ["CISA dashboard", "Word cloud"])
+workspace = st.sidebar.radio("Choose a view", ["CISA dashboard", "Model Hub Intelligence", "Word cloud"])
 
 if workspace == "CISA dashboard":
     render_cisa_dashboard()
+elif workspace == "Model Hub Intelligence":
+    render_model_hub_dashboard()
 else:
     st.title("Interactive AI Operations & Security Word Cloud")
     st.write("Customize keywords, adjust formatting styles, and export high-res images ready for social media.")
