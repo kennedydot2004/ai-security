@@ -61,6 +61,29 @@ def get_kaggle_api():
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def fetch_kaggle_models(limit=100):
+    api = get_kaggle_api()
+    try:
+        models = api.model_list(page_size=int(limit)) or []
+    except Exception as exc:
+        raise ValueError(f"Kaggle request failed ({type(exc).__name__}).") from None
+    records = []
+    for model in models:
+        if model is None:
+            continue
+        records.append(
+            {
+                name: getattr(model, name, None)
+                for name in (
+                    "ref", "author", "title", "subtitle", "description", "tags",
+                    "vote_count", "publish_time", "update_time", "is_private", "url",
+                )
+            }
+        )
+    return records
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_openml_models(limit=2000):
     api_key = get_openml_api_key()
     if not api_key:
@@ -419,6 +442,12 @@ def openml_model_url(row):
     return f"{OPENML_FLOW_PAGE_URL}{row['openml_id']}" if row.get("openml_id") else ""
 
 
+def kaggle_model_url(row):
+    if row.get("kaggle_url"):
+        return row["kaggle_url"]
+    return f"https://www.kaggle.com/models/{row['model_id']}" if row["model_id"] else ""
+
+
 def _finalize_model_frame(rows, columns, url_builder):
     df = pd.DataFrame(rows)
     if df.empty:
@@ -530,6 +559,39 @@ def normalize_openml_models(raw_models):
     return _finalize_model_frame(rows, columns, openml_model_url)
 
 
+def normalize_kaggle_models(raw_models):
+    columns = _model_columns()
+    rows = []
+    for item in raw_models or []:
+        if not isinstance(item, dict):
+            continue
+        ref = str(item.get("ref") or "").strip()
+        if not ref:
+            continue
+        tags = item.get("tags")
+        tags = [str(getattr(t, "name", t)) for t in tags if t is not None] if isinstance(tags, list) else []
+        rows.append(
+            {
+                "model_id": ref,
+                "author": str(item.get("author") or (ref.split("/", 1)[0] if "/" in ref else "unknown")),
+                "pipeline_tag": "unknown",
+                "library_name": "unknown",
+                "downloads": 0,
+                "likes": _safe_count(item.get("vote_count")),
+                "license": "unknown",
+                "createdAt": item.get("publish_time"),
+                "lastModified": item.get("update_time") or item.get("publish_time"),
+                "tags": tags,
+                "has_model_card_like": bool(item.get("description") or item.get("subtitle")),
+                "private": bool(item.get("is_private", False)),
+                "gated": False,
+                "disabled": False,
+                "kaggle_url": str(item.get("url") or ""),
+            }
+        )
+    return _finalize_model_frame(rows, columns, kaggle_model_url)
+
+
 def apply_risk_scores(models, weights):
     """Return a copy of models with risk_score (clipped 0-100) and risk_band."""
     scored = models.copy()
@@ -566,18 +628,23 @@ def load_openml_models():
     return normalize_openml_models(fetch_openml_models())
 
 
+def load_kaggle_models():
+    return normalize_kaggle_models(fetch_kaggle_models())
+
+
 # Provider registry: label -> loader returning a normalized frame (None = coming soon).
 # New providers should supply a fetch + normalize pair producing the same columns.
 MODEL_HUB_PROVIDERS = {
     "Hugging Face": load_hf_models,
     "OpenML": load_openml_models,
-    "Kaggle (coming soon)": None,
+    "Kaggle": load_kaggle_models,
 }
 
 # Provider label -> (display name, docs URL, cached fetch function to clear on refresh).
 MODEL_HUB_SOURCES = {
     "Hugging Face": ("Hugging Face", "https://huggingface.co/docs/hub/api", fetch_hf_models),
     "OpenML": ("OpenML", "https://www.openml.org/apis", fetch_openml_models),
+    "Kaggle": ("Kaggle", "https://www.kaggle.com/docs/api", fetch_kaggle_models),
 }
 
 
