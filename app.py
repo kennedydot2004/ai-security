@@ -975,11 +975,16 @@ def _kaggle_slug(competition):
 
 def _clean_error(exc):
     text = f"{type(exc).__name__}: {str(exc).strip()[:300]}"
-    if "401" in text or "403" in text:
+    if "401" in text:
         text += (
             f". Kaggle rejected the credentials (auth method: {kaggle_auth_method()}). "
             "Regenerate the token or API key at kaggle.com/settings, update the Streamlit secrets, "
-            "and reboot the app. A scoped token must allow competitions."
+            "and reboot the app."
+        )
+    elif "403" in text:
+        text += (
+            ". Kaggle denied access. Join the competition and accept its rules on kaggle.com, "
+            "and make sure your access token allows competitions."
         )
     return text
 
@@ -1140,12 +1145,24 @@ def render_kaggle_competitions():
                 st.error(f"Kaggle rejected or failed the submission: {_clean_error(exc)}")
 
     with results_tab:
+        submissions = pd.DataFrame()
+        leaderboard = pd.DataFrame()
         try:
             submissions = fetch_kaggle_submissions(selected_slug)
+        except ValueError as exc:
+            if "403" in str(exc):
+                st.warning(
+                    "Kaggle denied access to your submissions for this competition. "
+                    "Join it and accept its rules at "
+                    f"[{competition['url']}]({competition['url']}), then reload. "
+                    "If you have already joined, your access token may not include competitions."
+                )
+            else:
+                st.error(f"Could not load your submissions: {exc}")
+        try:
             leaderboard = fetch_kaggle_leaderboard(selected_slug)
         except ValueError as exc:
-            st.error(f"Could not load results: {exc}")
-            return
+            st.error(f"Could not load the leaderboard: {exc}")
         st.subheader("My submissions")
         if submissions.empty:
             st.info("No submissions yet for this competition.")
