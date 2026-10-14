@@ -48,27 +48,27 @@ def get_openml_api_key():
 @st.cache_resource(show_spinner=False)
 def get_kaggle_api():
     """Authenticate once per process; credentials must be set before importing kaggle."""
-    try:
-        username = st.secrets.get("KAGGLE_USERNAME")
-    except Exception:
-        username = None
-    try:
-        key = st.secrets.get("KAGGLE_KEY") or st.secrets.get("KAGGLE_API_TOKEN")
-    except Exception:
-        key = None
+    def lookup(name):
+        try:
+            value = st.secrets.get(name)
+        except Exception:  # no secrets file configured
+            value = None
+        value = value or os.getenv(name)
+        return str(value).strip() if value else None
 
-    username = username or os.getenv("KAGGLE_USERNAME")
-    key = key or os.getenv("KAGGLE_KEY") or os.getenv("KAGGLE_API_TOKEN")
+    username, key, token = lookup("KAGGLE_USERNAME"), lookup("KAGGLE_KEY"), lookup("KAGGLE_API_TOKEN")
 
-    if not username or not key:
+    if token:
+        os.environ["KAGGLE_API_TOKEN"] = token
+    elif username and key:
+        os.environ["KAGGLE_USERNAME"] = username
+        os.environ["KAGGLE_KEY"] = key
+    else:
+        missing = [n for n, v in (("KAGGLE_USERNAME", username), ("KAGGLE_KEY", key)) if not v]
         raise ValueError(
-            "Kaggle credentials are not configured. Set KAGGLE_USERNAME and either "
-            "KAGGLE_KEY or KAGGLE_API_TOKEN in Streamlit secrets or environment variables."
+            "Kaggle credentials are not configured. Add KAGGLE_API_TOKEN, or both "
+            f"KAGGLE_USERNAME and KAGGLE_KEY, to Streamlit secrets (missing: {', '.join(missing)})."
         )
-
-    os.environ["KAGGLE_USERNAME"] = str(username)
-    # Kaggle client expects KAGGLE_KEY even when the value came from KAGGLE_API_TOKEN
-    os.environ["KAGGLE_KEY"] = str(key)
     from kaggle.api.kaggle_api_extended import KaggleApi
 
     api = KaggleApi()
