@@ -3,4 +3,4 @@ matplotlib
 pandas
 requests
 streamlit
-wordcloud
+wordcloudkaggle

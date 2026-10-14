@@ -45,6 +45,21 @@ def get_openml_api_key():
     return str(key).strip() if key else None
 
 
+@st.cache_resource(show_spinner=False)
+def get_kaggle_api():
+    """Authenticate once per process; credentials must be set before importing kaggle."""
+    try:
+        os.environ["KAGGLE_USERNAME"] = st.secrets["KAGGLE_USERNAME"]
+        os.environ["KAGGLE_KEY"] = st.secrets["KAGGLE_KEY"]
+    except (KeyError, FileNotFoundError) as exc:
+        raise ValueError(f"Kaggle credentials are not configured in Streamlit secrets: {exc}") from None
+    from kaggle.api.kaggle_api_extended import KaggleApi
+
+    api = KaggleApi()
+    api.authenticate()
+    return api
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_openml_models(limit=2000):
     api_key = get_openml_api_key()
