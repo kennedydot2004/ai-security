@@ -48,15 +48,29 @@ def get_openml_api_key():
 @st.cache_resource(show_spinner=False)
 def get_kaggle_api():
     """Authenticate once per process; credentials must be set before importing kaggle."""
-    def lookup(name):
-        try:
-            value = st.secrets.get(name)
-        except Exception:  # no secrets file configured
-            value = None
-        value = value or os.getenv(name)
-        return str(value).strip() if value else None
+    # Flatten top-level and one level of nested secrets so [section] placement still works.
+    flat = {}
+    try:
+        for name, value in st.secrets.items():
+            if hasattr(value, "items"):
+                for sub_name, sub_value in value.items():
+                    flat.setdefault(str(sub_name).strip().upper(), sub_value)
+            else:
+                flat.setdefault(str(name).strip().upper(), value)
+    except Exception:  # no secrets file configured
+        pass
+    seen = sorted(n for n in flat if "KAGGLE" in n)
 
-    username, key, token = lookup("KAGGLE_USERNAME"), lookup("KAGGLE_KEY"), lookup("KAGGLE_API_TOKEN")
+    def lookup(*names):
+        for name in names:
+            value = flat.get(name) or os.getenv(name)
+            if value:
+                return str(value).strip().strip("\"'")
+        return None
+
+    username = lookup("KAGGLE_USERNAME")
+    key = lookup("KAGGLE_KEY", "KAGGLE_API_KEY")
+    token = lookup("KAGGLE_API_TOKEN")
 
     if token:
         os.environ["KAGGLE_API_TOKEN"] = token
@@ -67,8 +81,9 @@ def get_kaggle_api():
         missing = [n for n, v in (("KAGGLE_USERNAME", username), ("KAGGLE_KEY", key)) if not v]
         raise ValueError(
             "Kaggle credentials are not configured. Add KAGGLE_API_TOKEN, or both "
-            f"KAGGLE_USERNAME and KAGGLE_KEY, to Streamlit secrets (missing: {', '.join(missing)})."
-        )
+            f"KAGGLE_USERNAME and KAGGLE_KEY, to Streamlit secrets             (missing: {', '.join(missing)}). "
+                        f"Kaggle-related secret names detected: {', '.join(seen) or 'none'}."
+                    )
     from kaggle.api.kaggle_api_extended import KaggleApi
 
     api = KaggleApi()
