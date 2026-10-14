@@ -620,7 +620,11 @@ def normalize_kaggle_models(raw_models):
                 "kaggle_url": str(item.get("url") or ""),
             }
         )
-    return _finalize_model_frame(rows, columns, kaggle_model_url)
+    frame = _finalize_model_frame(rows, columns, kaggle_model_url)
+    # Kaggle's list API omits license and download counts, so those signals are unavailable, not risky.
+    frame["is_unknown_license"] = False
+    frame["is_high_adoption_low_transparency"] = False
+    return frame
 
 
 def apply_risk_scores(models, weights):
@@ -716,6 +720,11 @@ def render_model_hub_dashboard():
         f"Source: [{source_label} API]({source_url}) "
         f"· {len(models):,} models · Cached for up to 1 hour."
     )
+    if provider == "Kaggle":
+        st.caption(
+            "Kaggle's model list does not expose license or download counts, so the "
+            "unknown-license and high-adoption risk signals are not applied to Kaggle models."
+        )
 
     filter_columns = st.columns([1.3, 1.3, 1.3, 1, 1.2, 2])
     selected_tasks = filter_columns[0].multiselect(
