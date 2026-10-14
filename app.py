@@ -333,6 +333,17 @@ def render_cisa_dashboard():
 
 UNKNOWN_LICENSES = ["unknown", "other", ""]
 
+# Boolean feature column -> (slider label, default weight)
+RISK_WEIGHT_CONTROLS = {
+    "is_unknown_license": ("Unknown/other license", 25),
+    "is_missing_card": ("Missing model-card metadata", 25),
+    "is_stale": ("Stale (>365 days)", 20),
+    "is_gated": ("Gated access", 10),
+    "is_disabled": ("Disabled", 20),
+    "is_high_adoption_low_transparency": ("High adoption + low transparency", 20),
+}
+RISK_FEATURES = list(RISK_WEIGHT_CONTROLS)
+
 
 def _safe_count(value):
     if isinstance(value, bool):
@@ -348,8 +359,8 @@ def normalize_hf_models(raw_models):
     columns = [
         "model_id", "author", "pipeline_tag", "library_name", "downloads", "likes",
         "license", "createdAt", "lastModified", "tags", "has_model_card_like",
-        "private", "gated", "disabled", "days_since_update", "risk_score",
-        "risk_band", "model_url",
+        "private", "gated", "disabled", "days_since_update", *RISK_FEATURES,
+        "model_url",
     ]
     rows = []
     for item in raw_models or []:
@@ -394,39 +405,84 @@ def normalize_hf_models(raw_models):
         (pd.Timestamp.now(tz="UTC") - df["lastModified"]).dt.days.fillna(99999).clip(lower=0)
     ).astype(int)
 
-    unknown_license = df["license"].str.casefold().isin(UNKNOWN_LICENSES)
-    low_transparency = unknown_license | ~df["has_model_card_like"]
-    high_adoption = df["downloads"] >= df["downloads"].quantile(0.90)
-    raw_risk = (
-        unknown_license.astype(int) * 25
-        + (~df["has_model_card_like"]).astype(int) * 25
-        + (df["days_since_update"] > 365).astype(int) * 20
-        + df["gated"].astype(int) * 10
-        + df["disabled"].astype(int) * 20
-        + (high_adoption & low_transparency).astype(int) * 20
-    )
-    df["risk_score"] = raw_risk.clip(0, 100)
-    df["risk_band"] = pd.cut(
-        df["risk_score"], bins=[-1, 29, 59, 100], labels=["Low", "Medium", "High"]
-    ).astype(str)
+    # Baseline feature engineering only; scoring is applied by apply_risk_scores().
+    df["is_unknown_license"] = df["license"].str.casefold().isin(UNKNOWN_LICENSES)
+    df["is_missing_card"] = ~df["has_model_card_like"]
+    df["is_stale"] = df["days_since_update"] > 365
+    df["is_gated"] = df["gated"]
+    df["is_disabled"] = df["disabled"]
+    df["is_high_adoption_low_transparency"] = (
+        df["downloads"] >= df["downloads"].quantile(0.90)
+    ) & (df["is_unknown_license"] | df["is_missing_card"])
     df["model_url"] = df["model_id"].apply(
         lambda model_id: f"https://huggingface.co/{model_id}" if model_id else ""
     )
     return df[columns]
 
 
+def apply_risk_scores(models, weights):
+    """Return a copy of models with risk_score (clipped 0-100) and risk_band."""
+    scored = models.copy()
+    raw_risk = pd.Series(0, index=scored.index, dtype="int64")
+    for feature, weight in weights.items():
+        if feature in scored.columns:
+            raw_risk = raw_risk + scored[feature].fillna(False).astype(bool).astype(int) * int(weight)
+    scored["risk_score"] = raw_risk.clip(0, 100).astype(int)
+    scored["risk_band"] = pd.cut(
+        scored["risk_score"], bins=[-1, 29, 59, 100], labels=["Low", "Medium", "High"]
+    ).astype(str)
+    return scored
+
+
+def render_risk_weight_controls():
+    with st.sidebar.expander("Risk weights", expanded=False):
+        st.caption("Tune the heuristic; scores and bands recompute live (clipped to 0–100).")
+        weights = {
+            feature: st.slider(label, 0, 50, default, key=f"risk_weight_{feature}")
+            for feature, (label, default) in RISK_WEIGHT_CONTROLS.items()
+        }
+        if st.button("Reset risk weights", width="stretch"):
+            for feature in RISK_WEIGHT_CONTROLS:
+                st.session_state.pop(f"risk_weight_{feature}", None)
+            st.rerun()
+    return weights
+
+
+def load_hf_models():
+    return normalize_hf_models(fetch_hf_models())
+
+
+# Provider registry: label -> loader returning a normalized frame (None = coming soon).
+# New providers should supply a fetch + normalize pair producing the same columns.
+MODEL_HUB_PROVIDERS = {
+    "Hugging Face": load_hf_models,
+    "OpenML (coming soon)": None,
+    "Kaggle (coming soon)": None,
+}
+
+
 def render_model_hub_dashboard():
     st.title("Model Hub Intelligence")
+    provider = st.radio("Provider", list(MODEL_HUB_PROVIDERS), horizontal=True)
+    loader = MODEL_HUB_PROVIDERS[provider]
+    if loader is None:
+        st.info(
+            f"{provider.split(' (')[0]} support is planned. "
+            "Select Hugging Face to explore model metadata today."
+        )
+        return
+
     st.caption(
         "Explore adoption, transparency, risk, and operational signals from public Hugging Face model metadata."
     )
 
     if st.sidebar.button("Refresh model hub data", width="stretch"):
         fetch_hf_models.clear()
+    weights = render_risk_weight_controls()
 
     try:
         with st.spinner("Loading the Hugging Face model catalog..."):
-            models = normalize_hf_models(fetch_hf_models())
+            models = loader()
     except (requests.RequestException, ValueError) as exc:
         st.error(f"Could not load Hugging Face model data: {exc}")
         return
@@ -434,6 +490,8 @@ def render_model_hub_dashboard():
     if models.empty:
         st.warning("The Hugging Face API returned no model records.")
         return
+
+    models = apply_risk_scores(models, weights)
 
     st.caption(
         f"Source: [Hugging Face Hub API](https://huggingface.co/docs/hub/api) "
