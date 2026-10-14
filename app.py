@@ -3,6 +3,7 @@ from wordcloud import WordCloud
 import matplotlib.pyplot as plt
 import io
 import os
+import tempfile
 import requests
 import altair as alt
 import pandas as pd
@@ -947,14 +948,216 @@ BLEU Cost-Tracking Vector-Database Embedding RAG Cache-Rate Model-Versioning Lin
 Prompt-Engineering Fine-Tuning Inference GPU-Utilization Context-Window Evaluation
 """
 
+def _kaggle_slug(competition):
+    ref = str(getattr(competition, "ref", "") or getattr(competition, "url", "") or "").strip().rstrip("/")
+    return ref.rsplit("/", 1)[-1]
+
+
+def _clean_error(exc):
+    return f"{type(exc).__name__}: {str(exc).strip()[:300]}"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_kaggle_competitions(group="general", search=""):
+    api = get_kaggle_api()
+    try:
+        response = api.competitions_list(group=group, search=search or None, page_size=50)
+    except Exception as exc:
+        raise ValueError(f"Kaggle request failed ({_clean_error(exc)}).") from None
+    competitions = getattr(response, "competitions", None) or []
+    rows = []
+    for comp in competitions:
+        slug = _kaggle_slug(comp)
+        if not slug:
+            continue
+        rows.append(
+            {
+                "slug": slug,
+                "title": str(getattr(comp, "title", "") or slug),
+                "category": str(getattr(comp, "category", "") or ""),
+                "reward": str(getattr(comp, "reward", "") or ""),
+                "deadline": str(getattr(comp, "deadline", "") or ""),
+                "teams": getattr(comp, "team_count", 0) or 0,
+                "joined": bool(getattr(comp, "user_has_entered", False)),
+                "max_daily_submissions": getattr(comp, "max_daily_submissions", None),
+                "url": f"https://www.kaggle.com/competitions/{slug}",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def fetch_kaggle_submissions(slug):
+    api = get_kaggle_api()
+    try:
+        items = api.competition_submissions(slug) or []
+    except Exception as exc:
+        raise ValueError(f"Kaggle request failed ({_clean_error(exc)}).") from None
+    return pd.DataFrame(
+        [
+            {
+                "date": str(getattr(s, "date", "") or ""),
+                "description": str(getattr(s, "description", "") or ""),
+                "file": str(getattr(s, "file_name", "") or ""),
+                "status": str(getattr(s, "status", "") or ""),
+                "public_score": str(getattr(s, "public_score", "") or ""),
+                "private_score": str(getattr(s, "private_score", "") or ""),
+            }
+            for s in items
+            if s is not None
+        ]
+    )
+
+
+def fetch_kaggle_leaderboard(slug):
+    api = get_kaggle_api()
+    try:
+        items = api.competition_leaderboard_view(slug, page_size=20) or []
+    except Exception as exc:
+        raise ValueError(f"Kaggle request failed ({_clean_error(exc)}).") from None
+    return pd.DataFrame(
+        [
+            {
+                "rank": i,
+                "team": str(getattr(r, "team_name", "") or ""),
+                "score": str(getattr(r, "score", "") or ""),
+                "submitted": str(getattr(r, "submission_date", "") or ""),
+            }
+            for i, r in enumerate(items, start=1)
+            if r is not None
+        ]
+    )
+
+
+def submit_to_kaggle(slug, uploaded_file, message):
+    safe_name = os.path.basename(uploaded_file.name) or "submission.csv"
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        path = os.path.join(tmp_dir, safe_name)
+        with open(path, "wb") as handle:
+            handle.write(uploaded_file.getbuffer())
+        return get_kaggle_api().competition_submit(path, message, slug, quiet=True)
+
+
+def build_share_summary(competition, submissions, leaderboard):
+    lines = [f"Kaggle competition: {competition['title']}", competition["url"]]
+    if not submissions.empty:
+        latest = submissions.iloc[0]
+        lines.append(
+            f"My latest submission: {latest['description'] or latest['file']} "
+            f"- status {latest['status']}, public score {latest['public_score'] or 'pending'}"
+        )
+        lines.append(f"Total submissions: {len(submissions)}")
+    if not leaderboard.empty:
+        top = leaderboard.iloc[0]
+        lines.append(f"Current leader: {top['team']} ({top['score']})")
+    return "\n".join(lines)
+
+
+def render_kaggle_competitions():
+    st.title("Kaggle Competitions")
+    st.caption("Browse competitions, submit predictions to Kaggle, and share your results.")
+
+    search_col, group_col = st.columns([3, 1])
+    search = search_col.text_input("Search competitions", placeholder="e.g. titanic, security")
+    group = group_col.selectbox("Show", ["general", "entered", "hosted", "community"])
+    if st.sidebar.button("Refresh Kaggle competitions", width="stretch"):
+        fetch_kaggle_competitions.clear()
+
+    try:
+        with st.spinner("Loading Kaggle competitions..."):
+            competitions = fetch_kaggle_competitions(group, search.strip())
+    except ValueError as exc:
+        st.error(f"Could not load Kaggle competitions: {exc}")
+        return
+    if competitions.empty:
+        st.warning("No competitions found for this filter.")
+        return
+
+    titles = dict(zip(competitions["slug"], competitions["title"]))
+    selected_slug = st.selectbox("Competition", list(titles), format_func=lambda s: titles[s])
+    competition = competitions[competitions["slug"] == selected_slug].iloc[0].to_dict()
+
+    browse_tab, submit_tab, results_tab = st.tabs(["Browse", "Submit", "Results & share"])
+
+    with browse_tab:
+        st.dataframe(
+            competitions[["title", "category", "reward", "deadline", "teams", "joined", "url"]],
+            hide_index=True,
+            column_config={"url": st.column_config.LinkColumn("Link")},
+            width="stretch",
+        )
+
+    with submit_tab:
+        st.subheader(competition["title"])
+        st.markdown(f"[Open on Kaggle]({competition['url']}) to read the rules and download the data.")
+        if not competition["joined"]:
+            st.warning(
+                "You have not joined this competition. Open it on Kaggle and accept the rules "
+                "first, or the submission will be rejected."
+            )
+        if competition["max_daily_submissions"]:
+            st.caption(f"Daily submission limit: {competition['max_daily_submissions']}.")
+        uploaded = st.file_uploader(
+            "Submission file", type=["csv", "zip", "json", "parquet", "txt"], key=f"kaggle_file_{selected_slug}"
+        )
+        message = st.text_input("Submission message", value="Submitted from AI Security app", max_chars=200)
+        confirmed = st.checkbox(
+            "I confirm this submission is sent to Kaggle under my account and counts toward my daily limit.",
+            key=f"kaggle_confirm_{selected_slug}",
+        )
+        if st.button("Submit to Kaggle", type="primary", disabled=not (uploaded and confirmed)):
+            try:
+                with st.spinner("Uploading to Kaggle..."):
+                    submit_to_kaggle(selected_slug, uploaded, message.strip() or "Submitted from app")
+                st.success("Submission sent. Check the Results & share tab for its score.")
+            except Exception as exc:
+                st.error(f"Kaggle rejected or failed the submission: {_clean_error(exc)}")
+
+    with results_tab:
+        try:
+            submissions = fetch_kaggle_submissions(selected_slug)
+            leaderboard = fetch_kaggle_leaderboard(selected_slug)
+        except ValueError as exc:
+            st.error(f"Could not load results: {exc}")
+            return
+        st.subheader("My submissions")
+        if submissions.empty:
+            st.info("No submissions yet for this competition.")
+        else:
+            st.dataframe(submissions, hide_index=True, width="stretch")
+        st.subheader("Public leaderboard (top 20)")
+        if leaderboard.empty:
+            st.info("The leaderboard is not available for this competition.")
+        else:
+            st.dataframe(leaderboard, hide_index=True, width="stretch")
+
+        st.subheader("Share")
+        summary = build_share_summary(competition, submissions, leaderboard)
+        st.text_area("Shareable summary", summary, height=130)
+        download_cols = st.columns(2)
+        download_cols[0].download_button(
+            "Download summary (.txt)", summary, file_name=f"{selected_slug}_summary.txt", width="stretch"
+        )
+        if not submissions.empty:
+            download_cols[1].download_button(
+                "Download my submissions (.csv)",
+                submissions.to_csv(index=False),
+                file_name=f"{selected_slug}_submissions.csv",
+                width="stretch",
+            )
+
+
 # 3. Workspace selection
 st.sidebar.header("Workspace")
-workspace = st.sidebar.radio("Choose a view", ["CISA dashboard", "Model Hub Intelligence", "Word cloud"])
+workspace = st.sidebar.radio(
+    "Choose a view", ["CISA dashboard", "Model Hub Intelligence", "Kaggle Competitions", "Word cloud"]
+)
 
 if workspace == "CISA dashboard":
     render_cisa_dashboard()
 elif workspace == "Model Hub Intelligence":
     render_model_hub_dashboard()
+elif workspace == "Kaggle Competitions":
+    render_kaggle_competitions()
 else:
     st.title("Interactive AI Operations & Security Word Cloud")
     st.write("Customize keywords, adjust formatting styles, and export high-res images ready for social media.")
