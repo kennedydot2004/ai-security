@@ -73,23 +73,34 @@ def get_kaggle_api():
     key = lookup("KAGGLE_KEY", "KAGGLE_API_KEY")
     token = lookup("KAGGLE_API_TOKEN")
 
-    if token:
-        os.environ["KAGGLE_API_TOKEN"] = token
-    elif username and key:
-        os.environ["KAGGLE_USERNAME"] = username
-        os.environ["KAGGLE_KEY"] = key
-    else:
+    has_legacy = bool(username and key)
+    if not token and not has_legacy:
         missing = [n for n, v in (("KAGGLE_USERNAME", username), ("KAGGLE_KEY", key)) if not v]
         raise ValueError(
             "Kaggle credentials are not configured. Add KAGGLE_API_TOKEN, or both "
-            f"KAGGLE_USERNAME and KAGGLE_KEY, to Streamlit secrets             (missing: {', '.join(missing)}). "
-                        f"Kaggle-related secret names detected: {', '.join(seen) or 'none'}."
-                    )
+            f"KAGGLE_USERNAME and KAGGLE_KEY, to Streamlit secrets (missing: {', '.join(missing)}). "
+            f"Kaggle-related secret names detected: {', '.join(seen) or 'none'}."
+        )
+    # Provide every credential that exists: the client tries the token first, then the legacy key.
+    if token:
+        os.environ["KAGGLE_API_TOKEN"] = token
+    if has_legacy:
+        os.environ["KAGGLE_USERNAME"] = username
+        os.environ["KAGGLE_KEY"] = key
     from kaggle.api.kaggle_api_extended import KaggleApi
 
     api = KaggleApi()
     api.authenticate()
     return api
+
+
+def kaggle_auth_method():
+    """Name of the credential type the client is using (never the secret itself)."""
+    try:
+        api = get_kaggle_api()
+        return str(api.config_values.get(api.CONFIG_NAME_AUTH_METHOD, "unknown")).split(".")[-1]
+    except Exception:
+        return "unavailable"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -954,7 +965,14 @@ def _kaggle_slug(competition):
 
 
 def _clean_error(exc):
-    return f"{type(exc).__name__}: {str(exc).strip()[:300]}"
+    text = f"{type(exc).__name__}: {str(exc).strip()[:300]}"
+    if "401" in text or "403" in text:
+        text += (
+            f". Kaggle rejected the credentials (auth method: {kaggle_auth_method()}). "
+            "Regenerate the token or API key at kaggle.com/settings, update the Streamlit secrets, "
+            "and reboot the app. A scoped token must allow competitions."
+        )
+    return text
 
 
 @st.cache_data(ttl=900, show_spinner=False)
