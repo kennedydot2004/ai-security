@@ -72,6 +72,9 @@ def get_kaggle_api():
     username = lookup("KAGGLE_USERNAME")
     key = lookup("KAGGLE_KEY", "KAGGLE_API_KEY")
     token = lookup("KAGGLE_API_TOKEN")
+    # New-style access tokens start with KGAT_; they are rejected if sent as a legacy key.
+    if key and key.startswith("KGAT_"):
+        token, key = token or key, None
 
     has_legacy = bool(username and key)
     if not token and not has_legacy:
@@ -90,7 +93,13 @@ def get_kaggle_api():
     from kaggle.api.kaggle_api_extended import KaggleApi
 
     api = KaggleApi()
-    api.authenticate()
+    try:
+        api.authenticate()
+    except SystemExit:
+        raise ValueError(
+            "Kaggle rejected the configured credentials. Regenerate the access token "
+            "(starts with KGAT_) at kaggle.com/settings and update the Streamlit secrets."
+        ) from None
     return api
 
 
